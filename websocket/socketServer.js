@@ -11,11 +11,22 @@ class SocketServer {
   initialize(server) {
     this.io = socketIo(server, {
       cors: {
-        origin: [
-          'http://localhost:3000', // สำหรับ front-end
-          'http://127.0.0.1:5500', // สำหรับ Live Server VS Code
-        ],
-        methods: ["GET", "POST"],
+        origin: (origin, callback) => {
+          // ✅ Allow multiple origins
+          const allowedOrigins = [
+            'http://localhost:3000',
+            'http://127.0.0.1:5500',
+            'http://localhost:5500'
+          ];
+
+          if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+          } else {
+            console.warn(`⚠️ Blocked CORS request from origin: ${origin}`);
+            callback(new Error('Not allowed by CORS'));
+          }
+        },
+        methods: ["GET", "POST", "PATCH"],
         credentials: true
       },
       pingTimeout: 60000,
@@ -23,13 +34,13 @@ class SocketServer {
     });
 
     this.setupEventHandlers();
-    console.log('🌐 WebSocket server initialized');
+    console.log('🌐 WebSocket server initialized with CORS config');
     return this.io;
   }
 
   setupEventHandlers() {
     this.io.on('connection', (socket) => {
-      console.log(`👤 Client connected: ${socket.id}`);
+      console.log(`👤 Client connected: ${socket.id} (origin: ${socket.handshake.headers.origin})`);
 
       // Agent login
       socket.on('agent-login', async (data) => {
@@ -37,6 +48,7 @@ class SocketServer {
           const { agentCode, agentName } = data;
           console.log(`🔐 Agent login: ${agentCode}`);
 
+          // Update agent online status
           const agent = await AgentMongo.findOneAndUpdate(
             { agentCode },
             {
@@ -48,6 +60,7 @@ class SocketServer {
           );
 
           if (agent) {
+            // Store client info
             this.connectedClients.set(socket.id, {
               agentCode,
               agentName,
@@ -55,14 +68,17 @@ class SocketServer {
               loginTime: new Date()
             });
 
+            // Join agent to their room
             socket.join(`agent-${agentCode}`);
 
+            // Notify others
             socket.broadcast.emit('agent-online', {
               agentCode,
               agentName,
               timestamp: new Date()
             });
 
+            // Send welcome message
             socket.emit('login-success', {
               agent: agent,
               message: 'Successfully connected to Agent Wallboard System'
@@ -76,14 +92,17 @@ class SocketServer {
           }
         } catch (error) {
           console.error('❌ Agent login error:', error);
-          socket.emit('login-error', { message: 'Login failed' });
+          socket.emit('login-error', {
+            message: 'Login failed'
+          });
         }
       });
 
       // Agent logout
       socket.on('agent-logout', async () => {
         try {
-          if (this.connectedClients.has(socket.id)) {
+          const clientInfo = this.connectedClients.get(socket.id);
+          if (clientInfo) {
             await this.handleAgentDisconnect(socket.id);
           }
         } catch (error) {
@@ -91,45 +110,55 @@ class SocketServer {
         }
       });
 
-      // Join dashboard room
+      // Join dashboard room (for supervisors)
       socket.on('join-dashboard', () => {
         socket.join('dashboard');
         console.log(`📊 Client joined dashboard room: ${socket.id}`);
         this.sendDashboardUpdate();
       });
 
-      // Disconnect
+      // Handle disconnection
       socket.on('disconnect', async () => {
         console.log(`👤 Client disconnected: ${socket.id}`);
         await this.handleAgentDisconnect(socket.id);
       });
 
-      // Ping-pong
-      socket.on('ping', () => socket.emit('pong'));
+      // Ping-pong for connection health
+      socket.on('ping', () => {
+        socket.emit('pong');
+      });
     });
   }
 
   async handleAgentDisconnect(socketId) {
     try {
       const clientInfo = this.connectedClients.get(socketId);
-      if (!clientInfo) return;
 
-      const { agentCode, agentName } = clientInfo;
+      if (clientInfo) {
+        const { agentCode, agentName } = clientInfo;
 
-      await AgentMongo.findOneAndUpdate(
-        { agentCode },
-        { isOnline: false, socketId: null, status: 'Offline' }
-      );
+        // Update agent offline status
+        await AgentMongo.findOneAndUpdate(
+          { agentCode },
+          {
+            isOnline: false,
+            socketId: null,
+            status: 'Offline'
+          }
+        );
 
-      this.connectedClients.delete(socketId);
+        // Remove from connected clients
+        this.connectedClients.delete(socketId);
 
-      this.io.emit('agent-offline', {
-        agentCode,
-        agentName,
-        timestamp: new Date()
-      });
+        // Notify others
+        this.io.emit('agent-offline', {
+          agentCode,
+          agentName,
+          timestamp: new Date()
+        });
 
-      console.log(`🔌 Agent ${agentCode} disconnected and marked offline`);
+        console.log(`🔌 Agent ${agentCode} disconnected and marked offline`);
+      }
     } catch (error) {
       console.error('❌ Error handling agent disconnect:', error);
     }
@@ -138,7 +167,10 @@ class SocketServer {
   async sendDashboardUpdate() {
     try {
       const totalAgents = await AgentMongo.countDocuments({ isActive: true });
-      const onlineAgents = await AgentMongo.countDocuments({ isActive: true, isOnline: true });
+      const onlineAgents = await AgentMongo.countDocuments({
+        isActive: true,
+        isOnline: true
+      });
 
       const statusCounts = await AgentMongo.aggregate([
         { $match: { isActive: true, isOnline: true } },

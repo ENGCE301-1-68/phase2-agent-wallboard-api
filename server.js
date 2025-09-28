@@ -21,25 +21,38 @@ const AgentMongo = require('./models/AgentMongo'); // Phase 2 MongoDB model
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
-const WEBSOCKET_PORT = process.env.WEBSOCKET_PORT || 3002;
+
+// ✅ Allow multiple origins for both REST API + Socket.IO
+const allowedOrigins = [
+  "http://127.0.0.1:5500",
+  "http://localhost:5500",
+  "http://localhost:3000"
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS: " + origin));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], // ✅ เพิ่ม PATCH + OPTIONS
+  allowedHeaders: ["Content-Type", "Authorization"], // ✅ header ที่อนุญาต
+  credentials: true
+};
+
+// Handle preflight OPTIONS requests globally
+app.options('*', cors(corsOptions));
 
 // Initialize WebSocket
-const io = socketServer.initialize(server, {
-  cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-    methods: ["GET", "POST"],
-    credentials: true
-  }
-});
+const io = socketServer.initialize(server, { cors: corsOptions });
 
 // Security middleware
 app.use(helmet());
 
-// CORS configuration
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true
-}));
+// CORS configuration (REST API)
+app.use(cors(corsOptions));
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
@@ -83,7 +96,7 @@ app.get('/', (req, res) => {
       docs: '/api/docs'
     },
     websocket: {
-      url: `ws://localhost:${WEBSOCKET_PORT}`,
+      url: `ws://localhost:${PORT}`,
       events: ['agentStatusChanged', 'newMessage', 'dashboardUpdate']
     }
   });
@@ -100,17 +113,14 @@ app.use(globalErrorHandler);
 async function migrateFromMemoryToMongo() {
   try {
     console.log('🔄 Starting migration from in-memory to MongoDB...');
-
     if (agents.size === 0) {
       console.log('⚠️ No in-memory agents to migrate');
       return;
     }
-
     await AgentMongo.migrateFromMemory(agents);
     console.log('✅ Migration completed successfully');
   } catch (error) {
     console.error('❌ Migration failed:', error.message);
-    // Don't stop server if migration fails
   }
 }
 
@@ -118,14 +128,9 @@ async function migrateFromMemoryToMongo() {
 const startServer = async () => {
   try {
     console.log('🚀 Starting Agent Wallboard API Phase 2...');
-
-    // Connect to MongoDB
     await databaseConnection.connect();
-
-    // Migrate data from Phase 1 (if exists)
     await migrateFromMemoryToMongo();
 
-    // Start listening
     server.listen(PORT, () => {
       console.log('🎯━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
       console.log('🌟                PHASE 2 READY!                🌟');
@@ -152,41 +157,18 @@ const startServer = async () => {
 };
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('🛑 SIGTERM received, shutting down gracefully');
-
-  // Close WebSocket connections
-  if (io) {
-    io.close();
-  }
-
-  // Close database connection
+const gracefulShutdown = async () => {
+  console.log('🛑 Graceful shutdown...');
+  if (io) io.close();
   await databaseConnection.disconnect();
-
-  // Close HTTP server
   server.close(() => {
     console.log('✅ Process terminated gracefully');
     process.exit(0);
   });
-});
+};
 
-process.on('SIGINT', async () => {
-  console.log('🛑 SIGINT received, shutting down gracefully');
-
-  // Close WebSocket connections
-  if (io) {
-    io.close();
-  }
-
-  // Close database connection
-  await databaseConnection.disconnect();
-
-  // Close HTTP server
-  server.close(() => {
-    console.log('✅ Process terminated gracefully');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 startServer();
 
